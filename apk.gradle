@@ -1,0 +1,173 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:apksig:7.0.4'
+        classpath 'org.apktool:apktool-lib:2.6.0'
+    }
+}
+
+import brut.androlib.Androlib
+import brut.androlib.ApkDecoder
+import brut.androlib.ApkOptions
+
+import com.android.apksig.ApkSigner
+
+import java.security.KeyStore
+import java.security.PrivateKey
+import java.security.cert.X509Certificate
+
+abstract class ApkDecoderTask extends SourceTask {
+    @OutputDirectory
+    abstract DirectoryProperty getBuildDirectory()
+
+    @InputDirectory
+    abstract DirectoryProperty getSourceDirectory()
+
+    @Inject
+    abstract WorkerExecutor getWorkerExecutor()
+
+    @TaskAction
+    def decode() {
+        def workQueue = workerExecutor.noIsolation()
+
+        source.findAll { it.name.endsWith('.apk') || it.name.endsWith('.jar') }.each { sourceFile ->
+            def outputDirectory = buildDirectory.dir("${sourceFile}.out" -
+                            "${sourceDirectory.asFile.get()}/")
+
+            workQueue.submit(ApkDecoderWorkAction) { ApkDecoderWorkParameters parameters ->
+                parameters.sourceFile = sourceFile
+                parameters.outputDirectory = outputDirectory
+            }
+        }
+    }
+
+    static interface ApkDecoderWorkParameters extends WorkParameters {
+        RegularFileProperty getSourceFile()
+        DirectoryProperty getOutputDirectory()
+    }
+
+    static abstract class ApkDecoderWorkAction implements WorkAction<ApkDecoderWorkParameters> {
+        @Override
+        void execute() {
+            def decoder = new ApkDecoder()
+            decoder.setForceDelete(true)
+            decoder.setApkFile(parameters.sourceFile.asFile.get())
+            decoder.setOutDir(parameters.outputDirectory.asFile.get())
+            decoder.decode()
+        }
+    }
+}
+
+abstract class ApkBuilderTask extends SourceTask {
+    @Inject
+    abstract WorkerExecutor getWorkerExecutor()
+
+    @TaskAction
+    def decode() {
+        def workQueue = workerExecutor.noIsolation()
+
+        source.findAll { 'apktool.yml'.equals(it.name) }.each { sourceFile ->
+            workQueue.submit(ApkBuilderWorkAction) { ApkBuilderWorkParameters parameters ->
+                parameters.inputDirectory = sourceFile.parentFile
+            }
+        }
+    }
+
+    static interface ApkBuilderWorkParameters extends WorkParameters {
+        DirectoryProperty getInputDirectory()
+    }
+
+    static abstract class ApkBuilderWorkAction implements WorkAction<ApkBuilderWorkParameters> {
+        @Override
+        void execute() {
+            def outFileName = parameters.inputDirectory.asFile.get().name - '.out'
+            if (outFileName.endsWith('.apk')) {
+                outFileName = outFileName - '.apk' + '-unsigned.apk'
+            }
+
+            new Androlib().build(parameters.inputDirectory.asFile.get(),
+                    parameters.inputDirectory.file("../${outFileName}").get().asFile)
+        }
+    }
+}
+
+abstract class ApkSignerTask extends SourceTask {
+    @OutputDirectory
+    abstract DirectoryProperty getBuildDirectory()
+
+    @Input
+    abstract Property<String> getSignerName()
+
+    @InputFile
+    abstract RegularFileProperty getStoreFile()
+
+    @Input
+    abstract Property<String> getStorePassword()
+
+    @Input
+    abstract Property<String> getKeyAlias()
+
+    @Input
+    abstract Property<String> getKeyPassword()
+
+    @Inject
+    abstract WorkerExecutor getWorkerExecutor()
+
+    ApkSignerTask() {
+        signerName.convention(keyAlias)
+    }
+
+    @TaskAction
+    def decode() {
+        def workQueue = workerExecutor.noIsolation()
+
+        def keyStore = KeyStore.getInstance('JKS')
+        keyStore.load(storeFile.get().asFile.newInputStream(), storePassword.get().toCharArray())
+
+        def signerName = signerName
+        def privateKey = keyStore.getKey(keyAlias.get(), keyPassword.get().toCharArray())
+        def certificates = keyStore.getCertificateChain(keyAlias.get()).collect { (X509Certificate) it }
+
+        source.findAll { it.name.endsWith('-aligned.apk') }.each { sourceFile ->
+            def outputFile = buildDirectory.file("${sourceFile.path.replace('-aligned.apk', '.apk')}")
+
+            workQueue.submit(ApkSignerWorkAction) { ApkSignerWorkParameters parameters ->
+                parameters.sourceFile = sourceFile
+                parameters.signerName = signerName
+                parameters.privateKey = privateKey
+                parameters.certificates = certificates
+                parameters.outputFile = outputFile
+            }
+        }
+    }
+
+    static interface ApkSignerWorkParameters extends WorkParameters {
+        RegularFileProperty getSourceFile()
+        Property<String> getSignerName()
+        Property<PrivateKey> getPrivateKey()
+        ListProperty<X509Certificate> getCertificates()
+        RegularFileProperty getOutputFile()
+    }
+
+    static abstract class ApkSignerWorkAction implements WorkAction<ApkSignerWorkParameters> {
+        @Override
+        void execute() {
+            new ApkSigner.Builder([new ApkSigner.SignerConfig.Builder(parameters.signerName.get(), parameters.privateKey.get(), parameters.certificates.get()).build()])
+                    .setV1SigningEnabled(true)
+                    .setV2SigningEnabled(true)
+                    .setInputApk(parameters.sourceFile.asFile.get())
+                    .setOutputApk(parameters.outputFile.asFile.get())
+                    .setOtherSignersSignaturesPreserved(false)
+                    .build()
+                    .sign()
+        }
+    }
+}
+
+ext.ApkDecoder = ApkDecoderTask
+ext.ApkBuilder = ApkBuilderTask
+ext.ApkSigner = ApkSignerTask

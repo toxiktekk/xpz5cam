@@ -1,0 +1,58 @@
+stages:
+  - build
+  - upload
+  - release
+
+variables:
+  PACKAGE_NAME: "camera"
+  PACKAGE_REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${CI_COMMIT_TAG}"
+
+build:
+  stage: build
+  image: ubuntu:20.04
+  rules:
+    - if: $CI_COMMIT_TAG
+  cache:
+    key: ${CI_PROJECT_ID}
+    paths:
+      - .gradle/
+  before_script:
+    - apt -qq update && apt install -qqy --no-install-recommends patch default-jdk zipalign
+    - export GRADLE_USER_HOME=$(pwd)/.gradle
+    - mkdir -p "${GRADLE_USER_HOME}"
+    - chmod +x ./gradlew
+    - echo -n ${XPERIANCE_OFFICIAL_STORE_FILE} | base64 -d > ~/xperiance-official.jks
+    - echo "XPERIANCE_OFFICIAL_STORE_FILE=${HOME}/xperiance-official.jks" >> ${GRADLE_USER_HOME}/gradle.properties
+    - echo "XPERIANCE_OFFICIAL_STORE_PASSWORD=$(echo -n ${XPERIANCE_OFFICIAL_STORE_PASSWORD} | base64 -d)" >> ${GRADLE_USER_HOME}/gradle.properties
+    - echo "XPERIANCE_OFFICIAL_KEY_ALIAS=$(echo -n ${XPERIANCE_OFFICIAL_KEY_ALIAS})" >> ${GRADLE_USER_HOME}/gradle.properties
+    - echo "XPERIANCE_OFFICIAL_KEY_PASSWORD=$(echo -n ${XPERIANCE_OFFICIAL_KEY_PASSWORD} | base64 -d)" >> ${GRADLE_USER_HOME}/gradle.properties
+  script:
+    - ./gradlew packageMagiskModule
+  artifacts:
+    paths:
+      - build/outputs/magisk/
+
+upload:
+  stage: upload
+  image: curlimages/curl:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      for i in build/outputs/magisk/*.zip; do
+        curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file $i \
+          ${PACKAGE_REGISTRY_URL}/`basename $i`
+      done
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      for i in build/outputs/magisk/*.zip; do
+        asset_basename=`basename $i`
+        set -- "$@" --assets-link "{\"name\":\"${asset_basename}\",\"url\":\"${PACKAGE_REGISTRY_URL}/${asset_basename}\"}"
+      done
+      release-cli create --name "Release ${CI_COMMIT_TAG}" --tag-name ${CI_COMMIT_TAG} "$@"

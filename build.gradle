@@ -1,0 +1,139 @@
+plugins {
+    id 'org.ajoberstar.grgit' version '4.1.1'
+    id 'org.ajoberstar.reckon' version '0.13.1'
+}
+
+apply from: 'apk.gradle'
+
+reckon {
+    scopeFromProp()
+    stageFromProp('rc', 'final')
+}
+
+ext {
+    id = 'com.gitlab.xperiance.camera'
+    versionCode = grgit.log().size()
+    versionName = project.version.toString()
+
+    magiskArchiveFileBaseName = "${project.name}-${version}"
+
+    mainSrcDirectory = layout.projectDirectory.dir('src/main')
+    tmpBuildDirectory = layout.buildDirectory.dir('tmp')
+
+    apktoolBuildDirectory = tmpBuildDirectory.get().dir('apktool')
+    apktoolResourcesDirectory = mainSrcDirectory.dir('apktool')
+
+    magiskOutputDirectory = layout.buildDirectory.dir('outputs/magisk')
+    magiskResourcesDirectory = mainSrcDirectory.dir('magisk')
+
+    patchBuildDirectory = tmpBuildDirectory.get().dir('patch')
+    patchResourcesDirectory = mainSrcDirectory.dir('patch')
+
+    patches = [
+        'bypass_signature_check',
+        'high_speed_video_supported',
+        'nowide',
+        'permissions',
+        'sensors',
+        'vendor.somc.hardware.security.secd@1.0'
+    ]
+}
+
+tasks.register('decodeApk', ApkDecoder) {
+    buildDirectory = apktoolBuildDirectory
+    sourceDirectory = apktoolResourcesDirectory
+
+    source apktoolResourcesDirectory
+}
+
+tasks.register('patchApk') {
+    dependsOn decodeApk
+
+    doLast {
+        def buildDirectory = decodeApk.buildDirectory.asFile.get()
+
+        copy {
+            from buildDirectory
+            into patchBuildDirectory
+            // ugly hack - see https://github.com/iBotPeaches/Apktool/issues/1775
+            exclude '**/lib'
+        }
+
+        patches.each { patchFileBaseName ->
+            ant.patch(patchfile: patchResourcesDirectory.file("${patchFileBaseName}.patch"), strip: 1, dir: patchBuildDirectory)
+        }
+    }
+}
+
+tasks.register('rebuildApk', ApkBuilder) {
+    dependsOn patchApk
+
+    source patchBuildDirectory
+}
+
+tasks.register('zipalignApk') {
+    dependsOn rebuildApk
+
+    doLast {
+        patchBuildDirectory.asFileTree.matching {
+            include '**/*-unsigned.apk'
+        }.each { unsignedApkFile ->
+            exec {
+                executable 'zipalign'
+                args '-f', '4', unsignedApkFile, unsignedApkFile.path.replace('-unsigned.apk', '-aligned.apk')
+            }
+        }
+    }
+}
+
+tasks.register('signApk', ApkSigner) {
+    dependsOn zipalignApk
+
+    buildDirectory = patchBuildDirectory
+    storeFile = file(findProperty('XPERIANCE_OFFICIAL_STORE_FILE') ?: 'xperiance.jks')
+    storePassword = findProperty('XPERIANCE_OFFICIAL_STORE_PASSWORD') ?: 'xperiance'
+    keyAlias = findProperty('XPERIANCE_OFFICIAL_KEY_ALIAS') ?: 'xperiance'
+    keyPassword = findProperty('XPERIANCE_OFFICIAL_KEY_PASSWORD') ?: 'xperiance'
+
+    source patchBuildDirectory
+}
+
+tasks.register('packageMagiskModules', Zip) {
+    
+}
+
+tasks.register('packageMagiskModule', Zip) {
+    dependsOn signApk
+
+    archiveFileName = "${magiskArchiveFileBaseName}.zip"
+    destinationDirectory = magiskOutputDirectory
+    includeEmptyDirs = false
+
+    from(magiskResourcesDirectory) {
+        include 'module.prop'
+        expand(id: id, versionName: versionName, versionCode: versionCode)
+    }
+
+    from(magiskResourcesDirectory) {
+        exclude 'module.prop'
+    }
+
+    // ugly hack - see https://github.com/iBotPeaches/Apktool/issues/1775
+    from(apktoolBuildDirectory) {
+        include '**/lib/**/*.so'
+        eachFile {
+            it.path = it.path.replaceAll('\\/[^/]*\\.apk.out', '')
+                    .replace('arm64-v8a', 'arm64')
+                    .replace('armeabi-v7a', 'arm')
+        }
+    }
+
+    from(patchBuildDirectory) {
+        include '**/*.apk', '**/*.jar'
+        exclude '**/*-unsigned.apk', '**/*-aligned.apk'
+    }
+}
+
+tasks.register('clean') {
+    delete buildDir
+}
